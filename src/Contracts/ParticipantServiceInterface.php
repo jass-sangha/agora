@@ -1,0 +1,22 @@
+<?php
+
+namespace Chat\Contracts;
+
+use Chat\Models\Conversation;
+use Chat\Models\Message;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Collection;
+
+interface ParticipantServiceInterface
+{
+    /**
+     * @param  Collection<int, Model>  $chatables
+     */
+    public function addParticipants(Conversation $conversation, Collection $chatables, Model $actor): Message;
+
+    public function removeParticipant(Conversation $conversation, Model $target, Model $actor): Message;
+
+    public function changeRole(Conversation $conversation, Model $target, string $role): Message;
+
+    public function leaveGroup(Conversation $conversation, Model $chatable): void;
+}

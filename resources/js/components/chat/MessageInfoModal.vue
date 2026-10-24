@@ -1,0 +1,148 @@
+<script setup>
+import { computed, onMounted, ref } from 'vue';
+import Avatar from '../shared/Avatar.vue';
+import Modal from '../shared/Modal.vue';
+import Icon from '../shared/Icon.vue';
+import { useUsers } from '../../composables/useUsers';
+import { useMessages } from '../../composables/useMessages';
+import { useChatStore } from '../../store';
+import { chatableKey } from '../../chatable';
+
+const props = defineProps({
+    message: { type: Object, required: true },
+});
+
+const emit = defineEmits(['close']);
+
+const store = useChatStore();
+const { resolve, get } = useUsers();
+const { receipts } = useMessages();
+
+const loading = ref(true);
+
+// Fetched on demand (GET /messages/{id}/receipts) rather than read off props.message —
+// per-receipt delivered_at/read_at detail is no longer included in the timeline response
+// itself, since this modal was its only consumer but every page load was paying to compute
+// and ship it for every message regardless of whether anyone ever opened "message info".
+const details = ref([]);
+const readRows = computed(() => details.value
+    .filter((d) => d.read_at)
+    .sort((a, b) => new Date(b.read_at) - new Date(a.read_at)));
+const deliveredRows = computed(() => details.value
+    .filter((d) => d.delivered_at && !d.read_at)
+    .sort((a, b) => new Date(b.delivered_at) - new Date(a.delivered_at)));
+const pendingRows = computed(() => details.value.filter((d) => !d.delivered_at));
+
+const isGroup = computed(
+    () => store.conversations.find((c) => c.id === props.message.conversation_id)?.type === 'group',
+);
+
+const isCall = computed(() => props.message.type === 'call');
+const callParticipants = computed(() => props.message.metadata?.participants ?? []);
+
+onMounted(async () => {
+    if (!isCall.value) {
+        details.value = await receipts(props.message.id);
+    }
+
+    const refs = isCall.value
+        ? callParticipants.value.map((p) => ({ type: p.type, id: p.id }))
+        : details.value.map((d) => ({ type: d.chatable_type, id: d.chatable_id }));
+    if (refs.length) {
+        const unique = [...new Map(refs.map((r) => [chatableKey(r.type, r.id), r])).values()];
+        await resolve(unique);
+    }
+    loading.value = false;
+});
+
+function name(detail) {
+    return get({ type: detail.chatable_type, id: detail.chatable_id }).name;
+}
+
+function avatarUrl(detail) {
+    return get({ type: detail.chatable_type, id: detail.chatable_id }).avatar_url;
+}
+
+function formatTime(at) {
+    return new Date(at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}
+</script>
+
+<template>
+    <Modal class="chat-message-info-modal" title="Message info" @close="emit('close')">
+        <p class="mb-3 text-xs text-chat-textMuted">
+            Sent {{ formatTime(message.created_at) }}
+        </p>
+
+        <p v-if="loading" class="text-sm text-chat-textMuted">Loading&hellip;</p>
+
+        <template v-else-if="isCall">
+            <h3 class="mb-1 text-xs font-medium uppercase text-chat-textMuted">
+                Joined the call ({{ callParticipants.length }})
+            </h3>
+            <ul class="flex flex-col gap-1">
+                <li v-for="p in callParticipants" :key="`${p.type}-${p.id}`" class="flex items-center gap-3 py-1">
+                    <Avatar :name="get(p).name" :avatar-url="get(p).avatar_url" :size="36" />
+                    <span class="min-w-0 flex-1 truncate text-sm text-chat-text">{{ get(p).name }}</span>
+                </li>
+            </ul>
+            <p v-if="!callParticipants.length" class="text-sm text-chat-textMuted">No one else joined.</p>
+        </template>
+
+        <template v-else>
+            <template v-if="isGroup">
+                <div v-if="readRows.length" class="mb-3">
+                    <h3 class="mb-1 flex items-center gap-1 text-xs font-medium uppercase text-chat-textMuted">
+                        <Icon name="double-check" :size="14" class="text-chat-accent" />
+                        Read by
+                    </h3>
+                    <ul class="flex flex-col gap-1">
+                        <li v-for="row in readRows" :key="`read-${row.chatable_type}-${row.chatable_id}`" class="flex items-center gap-3 py-1">
+                            <Avatar :name="name(row)" :avatar-url="avatarUrl(row)" :size="36" />
+                            <span class="min-w-0 flex-1 truncate text-sm text-chat-text">{{ name(row) }}</span>
+                            <span class="shrink-0 text-xs text-chat-textMuted">{{ formatTime(row.read_at) }}</span>
+                        </li>
+                    </ul>
+                </div>
+
+                <div v-if="deliveredRows.length" class="mb-3">
+                    <h3 class="mb-1 flex items-center gap-1 text-xs font-medium uppercase text-chat-textMuted">
+                        <Icon name="double-check" :size="14" />
+                        Delivered to
+                    </h3>
+                    <ul class="flex flex-col gap-1">
+                        <li v-for="row in deliveredRows" :key="`delivered-${row.chatable_type}-${row.chatable_id}`" class="flex items-center gap-3 py-1">
+                            <Avatar :name="name(row)" :avatar-url="avatarUrl(row)" :size="36" />
+                            <span class="min-w-0 flex-1 truncate text-sm text-chat-text">{{ name(row) }}</span>
+                            <span class="shrink-0 text-xs text-chat-textMuted">{{ formatTime(row.delivered_at) }}</span>
+                        </li>
+                    </ul>
+                </div>
+
+                <div v-if="pendingRows.length">
+                    <h3 class="mb-1 text-xs font-medium uppercase text-chat-textMuted">Pending</h3>
+                    <ul class="flex flex-col gap-1">
+                        <li v-for="row in pendingRows" :key="`pending-${row.chatable_type}-${row.chatable_id}`" class="flex items-center gap-3 py-1">
+                            <Avatar :name="name(row)" :avatar-url="avatarUrl(row)" :size="36" />
+                            <span class="min-w-0 flex-1 truncate text-sm text-chat-text">{{ name(row) }}</span>
+                        </li>
+                    </ul>
+                </div>
+
+                <p v-if="!details.length" class="text-sm text-chat-textMuted">No other participants yet.</p>
+            </template>
+
+            <template v-else>
+                <p v-if="readRows.length" class="flex items-center justify-between py-1 text-sm">
+                    <span class="text-chat-text">Read</span>
+                    <span class="text-chat-textMuted">{{ formatTime(readRows[0].read_at) }}</span>
+                </p>
+                <p v-if="deliveredRows.length || readRows.length" class="flex items-center justify-between py-1 text-sm">
+                    <span class="text-chat-text">Delivered</span>
+                    <span class="text-chat-textMuted">{{ formatTime((deliveredRows[0] ?? readRows[0])?.delivered_at ?? readRows[0]?.read_at) }}</span>
+                </p>
+                <p v-if="!details.length" class="text-sm text-chat-textMuted">Not delivered yet.</p>
+            </template>
+        </template>
+    </Modal>
+</template>

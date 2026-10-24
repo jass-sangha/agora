@@ -1,0 +1,285 @@
+<script setup>
+import { computed, onBeforeUnmount, ref } from "vue";
+import { useMessages } from "../../composables/useMessages";
+import Icon from "../shared/Icon.vue";
+
+const emit = defineEmits(["recorded", "recording-change"]);
+
+const { uploadAttachment } = useMessages();
+
+const phase = ref("idle"); // 'idle' | 'recording' | 'preview'
+const seconds = ref(0);
+const bars = ref(Array.from({ length: 32 }, () => 25));
+
+const audioEl = ref(null);
+const previewUrl = ref(null);
+const playing = ref(false);
+const currentTime = ref(0);
+const duration = ref(0);
+const sending = ref(false);
+
+let mediaRecorder = null;
+let chunks = [];
+let recordedBlob = null;
+let startedAt = 0;
+let secondsTimer = null;
+let barTimer = null;
+
+function formatTime(value) {
+    const m = Math.floor(value / 60)
+        .toString()
+        .padStart(2, "0");
+    const s = Math.floor(value % 60)
+        .toString()
+        .padStart(2, "0");
+    return `${m}:${s}`;
+}
+
+function setPhase(next) {
+    phase.value = next;
+    emit("recording-change", next !== "idle");
+}
+
+async function start() {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    chunks = [];
+    startedAt = Date.now();
+    seconds.value = 0;
+
+    mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+    mediaRecorder.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        clearInterval(secondsTimer);
+        clearInterval(barTimer);
+
+        // Cancelled recordings never reach here in the 'recording' phase — cancel() already
+        // moved the phase back to 'idle' before stopping the recorder.
+        if (phase.value !== "recording") return;
+
+        recordedBlob = new Blob(chunks, { type: "audio/webm" });
+        duration.value = Math.max(
+            1,
+            Math.round((Date.now() - startedAt) / 1000),
+        );
+        previewUrl.value = URL.createObjectURL(recordedBlob);
+        setPhase("preview");
+    };
+
+    mediaRecorder.start();
+    setPhase("recording");
+
+    secondsTimer = setInterval(() => {
+        seconds.value = Math.floor((Date.now() - startedAt) / 1000);
+    }, 250);
+
+    barTimer = setInterval(() => {
+        bars.value = bars.value.map(() => 20 + Math.random() * 80);
+    }, 220);
+}
+
+function stopRecording() {
+    mediaRecorder?.stop();
+}
+
+function cancelRecording() {
+    setPhase("idle");
+    mediaRecorder?.stop();
+}
+
+function resetPreview() {
+    audioEl.value?.pause();
+    if (previewUrl.value) URL.revokeObjectURL(previewUrl.value);
+    previewUrl.value = null;
+    recordedBlob = null;
+    playing.value = false;
+    currentTime.value = 0;
+    duration.value = 0;
+}
+
+function discardPreview() {
+    resetPreview();
+    setPhase("idle");
+}
+
+function togglePlay() {
+    if (!audioEl.value) return;
+    if (playing.value) {
+        audioEl.value.pause();
+    } else {
+        audioEl.value.play();
+    }
+}
+
+function onTimeUpdate() {
+    if (audioEl.value) currentTime.value = audioEl.value.currentTime;
+}
+
+function onEnded() {
+    playing.value = false;
+    currentTime.value = 0;
+}
+
+function seek(event) {
+    if (!audioEl.value || !duration.value) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const frac = Math.min(
+        1,
+        Math.max(0, (event.clientX - rect.left) / rect.width),
+    );
+    audioEl.value.currentTime = frac * duration.value;
+    currentTime.value = audioEl.value.currentTime;
+}
+
+const progressPct = computed(() => {
+    if (!duration.value) return 0;
+    return Math.min(
+        100,
+        Math.max(0, (currentTime.value / duration.value) * 100),
+    );
+});
+
+async function send() {
+    if (!recordedBlob || sending.value) return;
+    sending.value = true;
+
+    const file = new File([recordedBlob], `voice-${Date.now()}.webm`, {
+        type: "audio/webm",
+    });
+    const durationSeconds = Math.round(duration.value);
+    const attachment = await uploadAttachment(file);
+
+    sending.value = false;
+    resetPreview();
+    setPhase("idle");
+    emit("recorded", { attachment, durationSeconds });
+}
+
+onBeforeUnmount(() => {
+    clearInterval(secondsTimer);
+    clearInterval(barTimer);
+    if (phase.value === "recording") {
+        mediaRecorder?.stop();
+    }
+    if (previewUrl.value) URL.revokeObjectURL(previewUrl.value);
+});
+</script>
+
+<template>
+    <button
+        v-if="phase === 'idle'"
+        type="button"
+        title="Record a voice message"
+        class="flex h-[52px] w-[52px] shrink-0 items-center justify-center rounded-full bg-chat-accent text-chat-accentContrast shadow-chat"
+        @click="start"
+    >
+        <Icon name="mic" :size="21" />
+    </button>
+
+    <div
+        v-else-if="phase === 'recording'"
+        class="chat-voice-recorder flex h-[52px] flex-1 items-center gap-3 rounded-full bg-chat-surface px-[14px] shadow-chat"
+    >
+        <button
+            type="button"
+            title="Cancel"
+            class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-chat-danger hover:bg-chat-surfaceHover"
+            @click="cancelRecording"
+        >
+            <Icon name="trash" :size="18" />
+        </button>
+
+        <span
+            class="flex shrink-0 items-center gap-1.5 text-sm text-chat-danger"
+        >
+            <span
+                class="h-2 w-2 animate-pulse rounded-full bg-chat-danger"
+            />
+            {{ formatTime(seconds) }}
+        </span>
+
+        <div
+            class="flex h-6 flex-1 items-center gap-[2px] overflow-hidden rounded-full bg-chat-surfaceHover px-2"
+        >
+            <span
+                v-for="(height, index) in bars"
+                :key="index"
+                class="w-[2px] shrink-0 rounded-full bg-chat-accent"
+                :style="{ height: height + '%' }"
+            />
+        </div>
+
+        <button
+            type="button"
+            title="Stop recording"
+            class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-chat-accent text-chat-accentContrast"
+            @click="stopRecording"
+        >
+            <Icon name="stop" :size="14" />
+        </button>
+    </div>
+
+    <div
+        v-else
+        class="chat-voice-recorder-preview flex h-[52px] flex-1 items-center gap-2.5 rounded-full bg-chat-surface px-[14px] shadow-chat"
+    >
+        <span class="h-2 w-2 shrink-0 rounded-full bg-chat-accent" />
+
+        <span class="shrink-0 text-sm tabular-nums text-chat-textMuted">{{
+            formatTime(playing ? currentTime : duration)
+        }}</span>
+
+        <div class="relative h-6 flex-1 cursor-pointer" @pointerdown="seek">
+            <div
+                class="absolute inset-x-0 top-1/2 -translate-y-1/2 border-t-2 border-dashed border-chat-border"
+            />
+            <div
+                class="absolute top-1/2 -translate-y-1/2 border-t-2 border-solid border-chat-accent"
+                :style="{ width: progressPct + '%' }"
+            />
+            <div
+                class="absolute top-1/2 h-2.5 w-2.5 -ml-1.5 -translate-y-1/2 rounded-full bg-chat-accent shadow"
+                :style="{ left: progressPct + '%' }"
+            />
+        </div>
+
+        <button
+            type="button"
+            title="Discard"
+            class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-chat-textMuted hover:bg-chat-surfaceHover hover:text-chat-danger"
+            @click="discardPreview"
+        >
+            <Icon name="trash" :size="17" />
+        </button>
+
+        <button
+            type="button"
+            :title="playing ? 'Pause' : 'Play'"
+            class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-chat-textMuted hover:bg-chat-surfaceHover hover:text-chat-accentText"
+            @click="togglePlay"
+        >
+            <Icon :name="playing ? 'pause' : 'play'" :size="16" />
+        </button>
+
+        <button
+            type="button"
+            title="Send"
+            class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-chat-accent text-chat-accentContrast disabled:opacity-60"
+            :disabled="sending"
+            @click="send"
+        >
+            <Icon name="paper-plane" :size="16" />
+        </button>
+
+        <audio
+            v-if="previewUrl"
+            ref="audioEl"
+            :src="previewUrl"
+            class="hidden"
+            @play="playing = true"
+            @pause="playing = false"
+            @ended="onEnded"
+            @timeupdate="onTimeUpdate"
+        />
+    </div>
+</template>

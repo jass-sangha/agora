@@ -1,0 +1,272 @@
+<?php
+
+namespace Chat\Http\Controllers;
+
+use Chat\Chat;
+use Chat\Contracts\ConversationServiceInterface;
+use Chat\Http\Requests\MuteConversationRequest;
+use Chat\Http\Requests\StoreConversationRequest;
+use Chat\Http\Requests\UpdateConversationRequest;
+use Chat\Http\Resources\ConversationResource;
+use Chat\Models\Conversation;
+use Chat\Support\UploadLimitGuard;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Gate;
+
+class ConversationController extends Controller
+{
+    public function __construct(
+        protected ConversationServiceInterface $conversations,
+    ) {}
+
+    public function index(Request $request)
+    {
+        // Same minimum as user search — a too-short term still reaches
+        // Chat::matchingChatablePairs() (capped, but still a wasted 'contains' scan for very
+        // little signal) via the participant-name match clause, not just the name FULLTEXT/LIKE
+        // query this filter also drives.
+        $request->validate([
+            'q' => ['sometimes', 'string', 'min:'.(int) config('chat.user_search.min_length', 2)],
+        ]);
+
+        // Archived conversations are hidden from the main list by default, mirroring
+        // WhatsApp's behavior — pass ?archived=true to view the archived folder instead.
+        $filters = ['archived' => $request->boolean('archived', false)];
+
+        if ($request->boolean('pinned')) {
+            $filters['pinned'] = true;
+        }
+
+        if ($request->filled('q')) {
+            $filters['q'] = $request->string('q')->toString();
+        }
+
+        $perPage = (int) config('chat.pagination.conversations_per_page', 30);
+
+        $conversations = $this->conversations->listForUser(
+            $request->user(),
+            $filters,
+            $perPage,
+        );
+
+        // No settings preload needed here anymore: ConversationRepository::lastMessagesFor()
+        // no longer eager-loads receipts.chatable at all — each lastMessage carries a batched
+        // receipt_summary virtual attribute instead (see receiptSummariesFor()), which
+        // MessageResource reads directly without touching UserSettingsService per receipt.
+        return ConversationResource::collection($conversations);
+    }
+
+    public function store(StoreConversationRequest $request)
+    {
+        Gate::authorize('create', Conversation::class);
+
+        $actor = $request->user();
+        $data = $request->validated();
+        $participants = Chat::resolveMany($data['participants']);
+
+        if ($data['type'] === 'private') {
+            $other = $participants->first();
+
+            $result = $this->conversations->findOrCreatePrivate($actor, $other);
+
+            return (new ConversationResource($result['conversation']->load([
+                'participants' => fn ($query) => $query->whereNull('left_at'),
+                // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+            ])))
+                ->response()
+                ->setStatusCode($result['created'] ? 201 : 200);
+        }
+
+        $conversation = $this->conversations->createGroup(
+            ['name' => $data['name'] ?? null, 'description' => $data['description'] ?? null],
+            $participants,
+            $actor,
+        );
+
+        return (new ConversationResource($conversation->load([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ])))
+            ->response()
+            ->setStatusCode(201);
+    }
+
+    public function show(Conversation $conversation)
+    {
+        Gate::authorize('view', $conversation);
+
+        return new ConversationResource($conversation->load([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function update(UpdateConversationRequest $request, Conversation $conversation)
+    {
+        Gate::authorize('update', $conversation);
+
+        $updated = $this->conversations->update($conversation, $request->validated());
+
+        return new ConversationResource($updated->load([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function updateAvatar(Request $request, Conversation $conversation)
+    {
+        Gate::authorize('updateAvatar', $conversation);
+
+        UploadLimitGuard::assertWithinServerLimits($request, 'avatar');
+        $request->validate(['avatar' => ['required', 'image', 'max:5120']]);
+
+        $updated = $this->conversations->updateAvatar($conversation, $request->file('avatar'));
+
+        return new ConversationResource($updated->load([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function destroyAvatar(Request $request, Conversation $conversation)
+    {
+        Gate::authorize('updateAvatar', $conversation);
+
+        $updated = $this->conversations->removeAvatar($conversation);
+
+        return new ConversationResource($updated->load([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function mute(MuteConversationRequest $request, Conversation $conversation)
+    {
+        Gate::authorize('view', $conversation);
+
+        $this->conversations->mute(
+            $conversation,
+            $request->user(),
+            $request->validated()['muted_until'] ?? null,
+        );
+
+        return new ConversationResource($conversation->fresh([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function archive(Request $request, Conversation $conversation)
+    {
+        Gate::authorize('view', $conversation);
+
+        $this->conversations->setArchived(
+            $conversation,
+            $request->user(),
+            $request->boolean('archived', true),
+        );
+
+        return new ConversationResource($conversation->fresh([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function pin(Request $request, Conversation $conversation)
+    {
+        Gate::authorize('view', $conversation);
+
+        $this->conversations->setPinned(
+            $conversation,
+            $request->user(),
+            $request->boolean('pinned', true),
+        );
+
+        return new ConversationResource($conversation->fresh([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function unread(Request $request, Conversation $conversation)
+    {
+        Gate::authorize('view', $conversation);
+
+        $this->conversations->setManuallyUnread(
+            $conversation,
+            $request->user(),
+            $request->boolean('unread', true),
+        );
+
+        return new ConversationResource($conversation->fresh([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function favourite(Request $request, Conversation $conversation)
+    {
+        Gate::authorize('view', $conversation);
+
+        $this->conversations->setFavourited(
+            $conversation,
+            $request->user(),
+            $request->boolean('favourited', true),
+        );
+
+        return new ConversationResource($conversation->fresh([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function hide(Request $request, Conversation $conversation)
+    {
+        Gate::authorize('view', $conversation);
+
+        $this->conversations->setHidden(
+            $conversation,
+            $request->user(),
+            $request->boolean('hidden', true),
+        );
+
+        return new ConversationResource($conversation->fresh([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function wallpaper(Request $request, Conversation $conversation)
+    {
+        Gate::authorize('view', $conversation);
+
+        $request->validate(['wallpaper' => ['nullable', 'string', 'max:255']]);
+
+        $this->conversations->setWallpaper(
+            $conversation,
+            $request->user(),
+            $request->input('wallpaper'),
+        );
+
+        return new ConversationResource($conversation->fresh([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+
+    public function disappearing(Request $request, Conversation $conversation)
+    {
+        // Either participant may toggle disappearing messages in a private chat;
+        // only a group admin may change it for the whole group.
+        Gate::authorize($conversation->isGroup() ? 'update' : 'view', $conversation);
+
+        $request->validate(['ttl_seconds' => ['nullable', 'integer', 'min:1']]);
+
+        $updated = $this->conversations->setDisappearingTtl($conversation, $request->input('ttl_seconds'));
+
+        return new ConversationResource($updated->load([
+            'participants' => fn ($query) => $query->whereNull('left_at'),
+            // lastMessage deliberately absent — see ConversationResource::resolveLastMessage().
+        ]));
+    }
+}

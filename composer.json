@@ -1,0 +1,69 @@
+{
+    "name": "jass-sangha/agora",
+    "description": "Real-time Laravel chat package — 1-on-1 & group messaging, media sharing, reactions, read receipts, typing indicators & presence via WebSockets",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Jass Sangha"
+        }
+    ],
+    "keywords": [
+        "laravel",
+        "chat",
+        "messaging",
+        "whatsapp",
+        "reverb",
+        "realtime"
+    ],
+    "require": {
+        "php": "^8.2",
+        "illuminate/support": "^11.0|^12.0|^13.0",
+        "illuminate/broadcasting": "^11.0|^12.0|^13.0",
+        "illuminate/database": "^11.0|^12.0|^13.0",
+        "illuminate/notifications": "^11.0|^12.0|^13.0",
+        "laravel/sanctum": "^4.0",
+        "spatie/laravel-package-tools": "^1.16"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0|^10.0",
+        "pestphp/pest": "^3.0",
+        "pestphp/pest-plugin-laravel": "^3.0",
+        "mockery/mockery": "^1.6",
+        "laravel/pint": "^1.24"
+    },
+    "autoload": {
+        "psr-4": {
+            "Chat\\Support\\": "src/Support/",
+            "Chat\\": "src/",
+            "Chat\\Database\\Factories\\": "database/factories/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Chat\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Chat\\ChatServiceProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/pest",
+        "format": "vendor/bin/pint"
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "config": {
+        "platform": {
+            "php": "8.2.0"
+        },
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    }
+}

@@ -1,0 +1,550 @@
+<?php
+
+use Chat\Contracts\PresenceServiceInterface;
+use Chat\Contracts\UserSettingsServiceInterface;
+use Chat\Events\MessagesRead;
+use Chat\Events\UserTyping;
+use Chat\Models\ConversationParticipant;
+use Chat\Models\UserPresence;
+use Chat\Tests\Fixtures\User;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
+
+function presenceUser(string $email): User
+{
+    return User::query()->create(['name' => $email, 'email' => $email, 'password' => bcrypt('secret')]);
+}
+
+it('broadcasts MessagesRead when the reader shares read receipts', function () {
+    Event::fake([MessagesRead::class]);
+
+    $alice = presenceUser('alice-mrbroadcast@example.com');
+    $bob = presenceUser('bob-mrbroadcast@example.com');
+
+    $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'private',
+        'participants' => [chatableRef($bob)],
+    ])->json('data.id');
+
+    $this->actingAs($alice)
+        ->postJson("/api/chat/conversations/{$conversationId}/messages", ['type' => 'text', 'body' => 'hi'])
+        ->assertCreated();
+
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/read")->assertNoContent();
+
+    Event::assertDispatched(MessagesRead::class);
+});
+
+it('never broadcasts MessagesRead when the reader has read receipts turned off', function () {
+    // MessageRepository::applyReadReceiptPrivacy() and MessageResource's reciprocity logic
+    // already redact read_at on every REST path once a chatable disables show_read_receipts —
+    // this is the one path (a realtime push to every other active participant on the
+    // conversation's presence channel) that used to fire regardless of that setting.
+    Event::fake([MessagesRead::class]);
+
+    $alice = presenceUser('alice-mrsilent@example.com');
+    $bob = presenceUser('bob-mrsilent@example.com');
+
+    $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'private',
+        'participants' => [chatableRef($bob)],
+    ])->json('data.id');
+
+    $this->actingAs($alice)
+        ->postJson("/api/chat/conversations/{$conversationId}/messages", ['type' => 'text', 'body' => 'hi'])
+        ->assertCreated();
+
+    $this->actingAs($bob)->patchJson('/api/chat/profile/settings', ['show_read_receipts' => false])->assertOk();
+
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/read")->assertNoContent();
+
+    Event::assertNotDispatched(MessagesRead::class);
+});
+
+it('marks messages delivered and read, and never regresses on an earlier read call', function () {
+    $alice = presenceUser('alice-receipt@example.com');
+    $bob = presenceUser('bob-receipt@example.com');
+
+    $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'private',
+        'participants' => [chatableRef($bob)],
+    ])->json('data.id');
+
+    $ids = [];
+    foreach (range(1, 10) as $i) {
+        $ids[] = $this->actingAs($alice)
+            ->postJson("/api/chat/conversations/{$conversationId}/messages", ['type' => 'text', 'body' => "msg {$i}"])
+            ->json('data.id');
+    }
+
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/delivered")->assertNoContent();
+
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/read", [
+        'up_to_message_id' => $ids[9],
+    ])->assertNoContent();
+
+    $participant = ConversationParticipant::query()
+        ->where('conversation_id', $conversationId)
+        ->where('chatable_type', 'user')
+        ->where('chatable_id', $bob->id)
+        ->first();
+
+    expect($participant->last_read_message_id)->toBe($ids[9]);
+
+    // Regress attempt: marking read up to an earlier message must not move state backward.
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/read", [
+        'up_to_message_id' => $ids[4],
+    ])->assertNoContent();
+
+    $participant->refresh();
+    expect($participant->last_read_message_id)->toBe($ids[9]);
+});
+
+it('derives sent/delivered/read status from the batched receipt summary for a group conversation', function () {
+    // Proves correctness of the aggregate path (MessageRepository::receiptSummariesFor()) that
+    // replaced loading every receipt row (with its chatable) just to derive this one field —
+    // including the reciprocity rule (a recipient with read receipts turned off never counts
+    // toward "read", even if they genuinely have read it).
+    $alice = presenceUser('alice-groupstatus@example.com');
+    $bob = presenceUser('bob-groupstatus@example.com');
+    $carol = presenceUser('carol-groupstatus@example.com');
+    $dave = presenceUser('dave-groupstatus@example.com');
+
+    $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'group',
+        'name' => 'Status check',
+        'participants' => chatableRefs([$bob, $carol, $dave]),
+    ])->json('data.id');
+
+    $this->actingAs($carol)->patchJson('/api/chat/profile/settings', ['show_read_receipts' => false])->assertOk();
+
+    $messageId = $this->actingAs($alice)
+        ->postJson("/api/chat/conversations/{$conversationId}/messages", ['type' => 'text', 'body' => 'hello group'])
+        ->json('data.id');
+
+    $statusFor = fn () => collect(
+        $this->actingAs($alice)->getJson("/api/chat/conversations/{$conversationId}/messages")->json('data')
+    )->firstWhere('id', $messageId)['status'];
+
+    expect($statusFor())->toBe('sent');
+
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/delivered")->assertNoContent();
+    $this->actingAs($carol)->postJson("/api/chat/conversations/{$conversationId}/receipts/delivered")->assertNoContent();
+    $this->actingAs($dave)->postJson("/api/chat/conversations/{$conversationId}/receipts/delivered")->assertNoContent();
+
+    expect($statusFor())->toBe('delivered');
+
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/read", ['up_to_message_id' => $messageId])->assertNoContent();
+    $this->actingAs($carol)->postJson("/api/chat/conversations/{$conversationId}/receipts/read", ['up_to_message_id' => $messageId])->assertNoContent();
+    $this->actingAs($dave)->postJson("/api/chat/conversations/{$conversationId}/receipts/read", ['up_to_message_id' => $messageId])->assertNoContent();
+
+    // All three have genuinely read it, but Carol's own read-receipt sharing is off — her
+    // receipt can never contribute to read_count, so recipient_count === read_count is
+    // unreachable and the status stays capped at delivered.
+    expect($statusFor())->toBe('delivered');
+});
+
+it('keeps message-list query count flat regardless of conversation participant count', function () {
+    // The actual claim behind receiptSummariesFor(): a 50-participant conversation used to mean
+    // loading roughly as many receipt+chatable rows per message as there are participants, on
+    // every page load. This proves total query count for listing messages no longer scales with
+    // how many people are in the conversation.
+    $queryCountFor = function (int $participantCount) {
+        $alice = presenceUser("alice-scale-{$participantCount}@example.com");
+        $others = collect(range(1, $participantCount))->map(
+            fn ($i) => presenceUser("scale-{$participantCount}-{$i}@example.com")
+        );
+
+        $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+            'type' => 'group',
+            'name' => 'Scale check',
+            'participants' => chatableRefs($others),
+        ])->json('data.id');
+
+        $messageId = $this->actingAs($alice)
+            ->postJson("/api/chat/conversations/{$conversationId}/messages", ['type' => 'text', 'body' => 'hi'])
+            ->json('data.id');
+
+        // Half read, half only delivered — exercises both branches of the aggregate, not just
+        // the all-read or all-undelivered edge cases.
+        $others->values()->each(function ($user, $index) use ($conversationId, $messageId) {
+            $this->actingAs($user)->postJson("/api/chat/conversations/{$conversationId}/receipts/delivered")->assertNoContent();
+
+            if ($index % 2 === 0) {
+                $this->actingAs($user)->postJson("/api/chat/conversations/{$conversationId}/receipts/read", [
+                    'up_to_message_id' => $messageId,
+                ])->assertNoContent();
+            }
+        });
+
+        DB::flushQueryLog();
+        DB::enableQueryLog();
+        $this->actingAs($alice)->getJson("/api/chat/conversations/{$conversationId}/messages")->assertOk();
+        $count = count(DB::getQueryLog());
+        DB::disableQueryLog();
+
+        return $count;
+    };
+
+    $withFew = $queryCountFor(3);
+    $withMany = $queryCountFor(50);
+
+    expect($withMany)->toBe($withFew);
+});
+
+it('memoizes user-settings lookups within a request instead of one query per receipt', function () {
+    $alice = presenceUser('alice-settingsn1@example.com');
+    $bob = presenceUser('bob-settingsn1@example.com');
+    $carol = presenceUser('carol-settingsn1@example.com');
+    $dave = presenceUser('dave-settingsn1@example.com');
+
+    $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'group',
+        'name' => 'N+1 check',
+        'participants' => chatableRefs([$bob, $carol, $dave]),
+    ])->json('data.id');
+
+    $lastId = null;
+    foreach (range(1, 5) as $i) {
+        $lastId = $this->actingAs($alice)->postJson("/api/chat/conversations/{$conversationId}/messages", [
+            'type' => 'text',
+            'body' => "msg {$i}",
+        ])->assertCreated()->json('data.id');
+    }
+
+    // Each message now has a *read* receipt from bob/carol/dave (5 messages x 3 receipts =
+    // 15 rows) pointing at just 3 distinct users. receiptStatus() only calls
+    // allowsReadReceipts() once a receipt is actually read (undelivered/unread receipts
+    // short-circuit first), so without memoization this would be up to 15 separate
+    // chat_user_settings lookups for those same 3 users.
+    foreach ([$bob, $carol, $dave] as $recipient) {
+        $this->actingAs($recipient)->postJson("/api/chat/conversations/{$conversationId}/receipts/read", [
+            'up_to_message_id' => $lastId,
+        ])->assertNoContent();
+    }
+
+    DB::flushQueryLog();
+    DB::enableQueryLog();
+    $this->actingAs($alice)->getJson("/api/chat/conversations/{$conversationId}/messages")->assertOk();
+    $settingsQueries = collect(DB::getQueryLog())->filter(
+        fn ($entry) => str_contains($entry['query'], 'chat_user_settings') && str_starts_with(strtolower($entry['query']), 'select')
+    );
+    DB::disableQueryLog();
+
+    // receiptSummariesFor()'s read_count no longer goes through UserSettingsService at all —
+    // it queries chat_user_settings directly for the distinct chatables behind *actually read*
+    // receipts, grouped by morph type (bob/carol/dave, all 'user' — one group). That's 1 query
+    // regardless of receipt count (15 here) or page size, not one per distinct chatable and
+    // nowhere near one per receipt.
+    expect($settingsQueries)->toHaveCount(1);
+});
+
+it('exposes per-recipient delivered/read detail via the dedicated receipts endpoint, not the timeline', function () {
+    // Per-receipt detail moved off the message list response (see MessageResource) onto
+    // GET /messages/{message}/receipts — fetched on demand only when "message info" is opened,
+    // rather than computed and shipped for every message on every page load.
+    $alice = presenceUser('alice-info@example.com');
+    $bob = presenceUser('bob-info@example.com');
+
+    $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'private',
+        'participants' => [chatableRef($bob)],
+    ])->json('data.id');
+
+    $messageId = $this->actingAs($alice)
+        ->postJson("/api/chat/conversations/{$conversationId}/messages", ['type' => 'text', 'body' => 'seen?'])
+        ->json('data.id');
+
+    $listed = $this->actingAs($alice)->getJson("/api/chat/conversations/{$conversationId}/messages")->assertOk();
+    expect(collect($listed->json('data'))->firstWhere('id', $messageId))->not->toHaveKey('receipt_details');
+
+    $before = $this->actingAs($alice)->getJson("/api/chat/messages/{$messageId}/receipts")->assertOk();
+    $beforeDetail = $before->json('data.0');
+    expect($beforeDetail['chatable_id'])->toBe($bob->id)
+        ->and($beforeDetail['delivered_at'])->toBeNull()
+        ->and($beforeDetail['read_at'])->toBeNull();
+
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/delivered")->assertNoContent();
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/read", [
+        'up_to_message_id' => $messageId,
+    ])->assertNoContent();
+
+    $after = $this->actingAs($alice)->getJson("/api/chat/messages/{$messageId}/receipts")->assertOk();
+    $afterDetail = $after->json('data.0');
+    expect($afterDetail['chatable_id'])->toBe($bob->id)
+        ->and($afterDetail['delivered_at'])->not->toBeNull()
+        ->and($afterDetail['read_at'])->not->toBeNull();
+
+    // A non-participant must not be able to read another conversation's receipt detail.
+    $eve = presenceUser('eve-info@example.com');
+    $this->actingAs($eve)->getJson("/api/chat/messages/{$messageId}/receipts")->assertForbidden();
+});
+
+it('hides a recipient\'s read_at on the dedicated receipts endpoint when they have read receipts disabled', function () {
+    // MessageResource's aggregate status already respects each recipient's own read-receipts
+    // privacy (readCountsRespectingPrivacy()) — this raw per-receipt endpoint previously
+    // returned every recipient's actual read_at regardless of that setting, since it never went
+    // through that same privacy check.
+    $alice = presenceUser('alice-receiptprivacy@example.com');
+    $bob = presenceUser('bob-receiptprivacy@example.com');
+
+    $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'private',
+        'participants' => [chatableRef($bob)],
+    ])->json('data.id');
+
+    $this->actingAs($bob)->patchJson('/api/chat/profile/settings', ['show_read_receipts' => false])->assertOk();
+
+    $messageId = $this->actingAs($alice)
+        ->postJson("/api/chat/conversations/{$conversationId}/messages", ['type' => 'text', 'body' => 'hi'])
+        ->json('data.id');
+
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/read", [
+        'up_to_message_id' => $messageId,
+    ])->assertNoContent();
+
+    $detail = $this->actingAs($alice)->getJson("/api/chat/messages/{$messageId}/receipts")->assertOk();
+
+    expect($detail->json('data.0.read_at'))->toBeNull()
+        // delivered_at has no privacy setting in this package and stays visible.
+        ->and($detail->json('data.0.delivered_at'))->not->toBeNull();
+});
+
+it('hides every read_at on the dedicated receipts endpoint when the viewer has their own read receipts disabled', function () {
+    // Reciprocity: same rule MessageResource applies to the aggregate status — a viewer who's
+    // turned off their own read-receipt sharing doesn't get to see anyone else's read receipts
+    // either, regardless of each recipient's own setting.
+    $alice = presenceUser('alice-viewerreciprocity@example.com');
+    $bob = presenceUser('bob-viewerreciprocity@example.com');
+
+    $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'private',
+        'participants' => [chatableRef($bob)],
+    ])->json('data.id');
+
+    $this->actingAs($alice)->patchJson('/api/chat/profile/settings', ['show_read_receipts' => false])->assertOk();
+
+    $messageId = $this->actingAs($alice)
+        ->postJson("/api/chat/conversations/{$conversationId}/messages", ['type' => 'text', 'body' => 'hi'])
+        ->json('data.id');
+
+    $this->actingAs($bob)->postJson("/api/chat/conversations/{$conversationId}/receipts/read", [
+        'up_to_message_id' => $messageId,
+    ])->assertNoContent();
+
+    $detail = $this->actingAs($alice)->getJson("/api/chat/messages/{$messageId}/receipts")->assertOk();
+
+    expect($detail->json('data.0.read_at'))->toBeNull();
+});
+
+it('never writes to the database when broadcasting a typing indicator', function () {
+    $alice = presenceUser('alice-typing@example.com');
+    $bob = presenceUser('bob-typing@example.com');
+
+    $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'private',
+        'participants' => [chatableRef($bob)],
+    ])->json('data.id');
+
+    Event::fake();
+    DB::enableQueryLog();
+
+    $this->actingAs($alice)
+        ->postJson("/api/chat/conversations/{$conversationId}/typing", ['state' => 'start'])
+        ->assertNoContent();
+
+    $writes = collect(DB::getQueryLog())->filter(
+        fn ($entry) => str_starts_with(strtolower($entry['query']), 'insert')
+            || str_starts_with(strtolower($entry['query']), 'update')
+            || str_starts_with(strtolower($entry['query']), 'delete')
+    );
+
+    expect($writes)->toHaveCount(0);
+
+    Event::assertDispatched(UserTyping::class);
+
+    DB::disableQueryLog();
+});
+
+it('suppresses the typing broadcast when the sender has disabled typing indicators', function () {
+    $alice = presenceUser('alice-typingoff@example.com');
+    $bob = presenceUser('bob-typingoff@example.com');
+
+    $conversationId = $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'private',
+        'participants' => [chatableRef($bob)],
+    ])->json('data.id');
+
+    $this->actingAs($alice)->patchJson('/api/chat/profile/settings', [
+        'show_typing_indicator' => false,
+    ])->assertOk();
+
+    Event::fake();
+
+    $this->actingAs($alice)
+        ->postJson("/api/chat/conversations/{$conversationId}/typing", ['state' => 'start'])
+        ->assertNoContent();
+
+    Event::assertNotDispatched(UserTyping::class);
+});
+
+it('debounces presence heartbeat db writes and reports online status', function () {
+    $alice = presenceUser('alice-presence@example.com');
+
+    $this->actingAs($alice)->postJson('/api/chat/presence/heartbeat')->assertNoContent();
+
+    $status = $this->actingAs($alice)->getJson("/api/chat/users/user/{$alice->id}/presence")->assertOk();
+    expect($status->json('data.is_online'))->toBeTrue();
+
+    DB::enableQueryLog();
+    $this->actingAs($alice)->postJson('/api/chat/presence/heartbeat')->assertNoContent();
+    $writes = collect(DB::getQueryLog())->filter(
+        fn ($entry) => str_starts_with(strtolower($entry['query']), 'insert')
+            || str_starts_with(strtolower($entry['query']), 'update')
+    );
+    DB::disableQueryLog();
+
+    // Second heartbeat within the same debounce window should not touch chat_user_presence again.
+    expect($writes)->toHaveCount(0);
+});
+
+it('hides presence from a viewer who does not share a conversation with the target', function () {
+    // Privacy settings alone used to be the only gate — any authenticated user could look up
+    // any other chatable's presence by id/type as long as both had last-seen sharing on,
+    // regardless of whether they'd ever interacted. Presence must only be shared with someone
+    // the target actually shares a conversation with.
+    $alice = presenceUser('alice-presence-shared@example.com');
+    $stranger = presenceUser('stranger-presence-shared@example.com');
+
+    $this->actingAs($alice)->postJson('/api/chat/presence/heartbeat')->assertNoContent();
+
+    $status = $this->actingAs($stranger)->getJson("/api/chat/users/user/{$alice->id}/presence")->assertOk();
+    expect($status->json('data.is_online'))->toBeFalse()
+        ->and($status->json('data.last_seen_at'))->toBeNull();
+
+    // A participant of a shared conversation still sees the real status.
+    $this->actingAs($alice)->postJson('/api/chat/conversations', [
+        'type' => 'private',
+        'participants' => [chatableRef($stranger)],
+    ])->assertCreated();
+
+    $sharedStatus = $this->actingAs($stranger)->getJson("/api/chat/users/user/{$alice->id}/presence")->assertOk();
+    expect($sharedStatus->json('data.is_online'))->toBeTrue();
+});
+
+it('sweeps a stale heartbeat back to offline via the artisan command', function () {
+    $alice = presenceUser('alice-sweep@example.com');
+
+    $this->actingAs($alice)->postJson('/api/chat/presence/heartbeat')->assertNoContent();
+    expect($this->actingAs($alice)->getJson("/api/chat/users/user/{$alice->id}/presence")->json('data.is_online'))->toBeTrue();
+
+    // Past heartbeat_ttl_seconds + online_grace_seconds (60 + 90 default).
+    $this->travel(151)->seconds();
+
+    $this->artisan('chat:sweep-presence')->assertSuccessful();
+
+    expect($this->actingAs($alice)->getJson("/api/chat/users/user/{$alice->id}/presence")->json('data.is_online'))->toBeFalse();
+});
+
+it('sweeps every stale row across chunk boundaries, not just the first 200', function () {
+    // chunkById(200) advancing past a row it just flipped to is_online = false is exactly the
+    // behavior that could silently drop rows if the chunking were wired wrong (e.g. ordering by
+    // the wrong column, or re-including already-updated rows) — 201 rows forces at least two
+    // chunks, so this only passes if every chunk actually gets processed.
+    $rows = collect(range(1, 201))->map(fn ($i) => [
+        'chatable_type' => 'user',
+        'chatable_id' => 900000 + $i, // no matching user row on purpose — isolates the sweep/chunk
+        'is_online' => true,          // mechanics from the unrelated per-chatable broadcast path.
+        'last_seen_at' => now()->subDays(1),
+        'created_at' => now(),
+        'updated_at' => now(),
+    ])->all();
+    UserPresence::query()->insert($rows);
+
+    DB::flushQueryLog();
+    DB::enableQueryLog();
+    $count = app(PresenceServiceInterface::class)->sweepStale();
+    // A single get() would fetch all 201 rows in one SELECT regardless of correctness; two
+    // chat_user_presence SELECTs (201 rows over a 200-row chunk size) is what actually proves
+    // chunkById() is in effect rather than an unbounded fetch that just happens to still work.
+    $selects = collect(DB::getQueryLog())->filter(
+        fn ($entry) => str_contains($entry['query'], 'chat_user_presence') && str_starts_with(strtolower($entry['query']), 'select')
+    );
+    DB::disableQueryLog();
+
+    expect($count)->toBe(201)
+        ->and(UserPresence::query()->where('is_online', true)->count())->toBe(0)
+        ->and($selects)->toHaveCount(2);
+});
+
+it('checks conversation membership and privacy settings for a whole sweep chunk in one query each', function () {
+    // 1 stale user vs 5 — allowsLastSeen() and the conversation-id lookup used to run once per
+    // stale row inside the chunk loop; batching both per chunk means query count against
+    // chat_conversation_participants / chat_user_settings stays flat regardless of how many
+    // distinct users went stale in the same sweep, instead of growing by one query each per row.
+    $tableQueryCountsFor = function (int $staleUserCount) {
+        $rows = collect(range(1, $staleUserCount))->map(function ($i) use ($staleUserCount) {
+            $user = presenceUser("sweepn1-{$staleUserCount}-{$i}@example.com");
+            $other = presenceUser("sweepn1-other-{$staleUserCount}-{$i}@example.com");
+            privateConversationBetween($user, $other);
+
+            // Pre-seed a real settings row — a brand-new user with none yet always falls through
+            // to a per-row firstOrCreate() no matter how the sweep batches things (preload() has
+            // nothing existing to warm the cache with), which would test that fallback path
+            // instead of the steady-state one this batching actually optimizes for.
+            app(UserSettingsServiceInterface::class)->get($user);
+
+            return ['chatable_type' => 'user', 'chatable_id' => $user->id, 'is_online' => true, 'last_seen_at' => now()->subDays(1), 'created_at' => now(), 'updated_at' => now()];
+        });
+        UserPresence::query()->insert($rows->all());
+
+        DB::flushQueryLog();
+        DB::enableQueryLog();
+        app(PresenceServiceInterface::class)->sweepStale();
+        $log = collect(DB::getQueryLog());
+        DB::disableQueryLog();
+
+        return [
+            'participants' => $log->filter(fn ($e) => str_contains($e['query'], 'chat_conversation_participants') && str_starts_with(strtolower($e['query']), 'select'))->count(),
+            'settings' => $log->filter(fn ($e) => str_contains($e['query'], 'chat_user_settings') && str_starts_with(strtolower($e['query']), 'select'))->count(),
+        ];
+    };
+
+    $withOne = $tableQueryCountsFor(1);
+    $withFive = $tableQueryCountsFor(5);
+
+    expect($withFive['participants'])->toBe($withOne['participants'])
+        ->and($withFive['settings'])->toBe($withOne['settings']);
+});
+
+it('bulk-seeds missing settings rows for a sweep chunk instead of falling through to one firstOrCreate per row', function () {
+    // Deliberately brand-new users with no chat_user_settings row at all — most real users
+    // never touch privacy settings, so this is the common case, not an edge case.
+    // preload()'s own SELECT finds nothing to warm the cache with for them; without a bulk
+    // insertOrIgnore() for the gap, each one would fall through individually to get()'s
+    // firstOrCreate() later in the same chunk loop, right back to one SELECT + one INSERT per
+    // row — the exact N+1 this and the previous commit were both written to eliminate.
+    $settingsQueryCountFor = function (int $staleUserCount) {
+        $rows = collect(range(1, $staleUserCount))->map(function ($i) use ($staleUserCount) {
+            $user = presenceUser("sweepnosettings-{$staleUserCount}-{$i}@example.com");
+            $other = presenceUser("sweepnosettings-other-{$staleUserCount}-{$i}@example.com");
+            privateConversationBetween($user, $other);
+
+            return ['chatable_type' => 'user', 'chatable_id' => $user->id, 'is_online' => true, 'last_seen_at' => now()->subDays(1), 'created_at' => now(), 'updated_at' => now()];
+        });
+        UserPresence::query()->insert($rows->all());
+
+        DB::flushQueryLog();
+        DB::enableQueryLog();
+        app(PresenceServiceInterface::class)->sweepStale();
+        $count = collect(DB::getQueryLog())->filter(fn ($e) => str_contains($e['query'], 'chat_user_settings'))->count();
+        DB::disableQueryLog();
+
+        return $count;
+    };
+
+    $withOne = $settingsQueryCountFor(1);
+    $withFive = $settingsQueryCountFor(5);
+
+    expect($withFive)->toBe($withOne);
+});

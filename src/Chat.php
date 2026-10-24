@@ -1,0 +1,186 @@
+<?php
+
+namespace Chat;
+
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Collection;
+
+class Chat
+{
+    /**
+     * @return array<string, class-string<Model>> Alias => model class.
+     */
+    public static function chatableModels(): array
+    {
+        return collect(config('chat.chatable_models', []))
+            ->map(fn ($entry) => is_array($entry) ? $entry['model'] : $entry)
+            ->all();
+    }
+
+    /**
+     * The display-name column for a given chatable alias — its own configured
+     * name_field if chatable_models declared one, otherwise the global default.
+     */
+    public static function nameFieldFor(string $alias): string
+    {
+        $entry = config("chat.chatable_models.{$alias}");
+
+        if (is_array($entry) && isset($entry['name_field'])) {
+            return $entry['name_field'];
+        }
+
+        return config('chat.user_search.name_field', 'name');
+    }
+
+    /**
+     * The default chatable model class — the first entry in `chat.chatable_models`.
+     */
+    public static function defaultChatableModel(): string
+    {
+        return array_values(static::chatableModels())[0];
+    }
+
+    public static function isChatable(?Model $model): bool
+    {
+        return $model !== null && in_array($model::class, static::chatableModels(), true);
+    }
+
+    public static function table(string $key): string
+    {
+        return config("chat.table_names.{$key}", "chat_{$key}");
+    }
+
+    /**
+     * A stable identity string for a chatable model, safe to use in cache keys,
+     * array_diff/array_unique/pluck, etc. — plain numeric ids alone aren't unique
+     * once more than one chatable model type shares the same id space.
+     */
+    public static function identify(Model $chatable): string
+    {
+        return $chatable->getMorphClass().'|'.$chatable->getKey();
+    }
+
+    /**
+     * Split an identity string produced by identify() back into [type, id].
+     *
+     * @return array{0: string, 1: int|string}
+     */
+    public static function split(string $identity): array
+    {
+        [$type, $id] = explode('|', $identity, 2);
+
+        return [$type, is_numeric($id) ? (int) $id : $id];
+    }
+
+    /**
+     * Scope a query to rows belonging to the given chatable, matching both the
+     * `{prefix}_type` and `{prefix}_id` columns of a morphs()/nullableMorphs() pair.
+     */
+    public static function whereChatable(Builder $query, Model $chatable, string $prefix = 'chatable'): Builder
+    {
+        return $query
+            ->where("{$prefix}_type", $chatable->getMorphClass())
+            ->where("{$prefix}_id", $chatable->getKey());
+    }
+
+    /**
+     * Scope a messages query to rows that aren't past their disappearing-messages TTL.
+     * chat:prune-expired-messages physically deletes expired rows, but only on whatever
+     * schedule the host configures (see README's "Scheduled commands") — this is what actually
+     * makes an expired message invisible immediately, everywhere it would otherwise be read,
+     * rather than relying on that cleanup job's timing (or a host remembering to schedule it at
+     * all). $column defaults to the unqualified 'expires_at'; pass a table-qualified name (e.g.
+     * "{$table}.expires_at") when the query joins another table with its own such column.
+     */
+    public static function excludeExpiredMessages(Builder $query, string $column = 'expires_at'): Builder
+    {
+        return $query->where(fn ($q) => $q->whereNull($column)->orWhere($column, '>', now()));
+    }
+
+    /**
+     * Resolve a chatable model class from its morph map alias (e.g. "user").
+     */
+    public static function modelForAlias(string $alias): string
+    {
+        $model = static::chatableModels()[$alias] ?? null;
+
+        abort_if($model === null, 404, "Unknown chatable type [{$alias}].");
+
+        return $model;
+    }
+
+    /**
+     * Resolve a chatable alias + id (as they appear in routes/requests) into the
+     * actual model instance, or abort 404 if the type is unknown or the row doesn't exist.
+     */
+    public static function resolveChatable(string $alias, int|string $id): Model
+    {
+        $model = static::modelForAlias($alias);
+
+        return $model::query()->findOrFail($id);
+    }
+
+    /**
+     * Resolve a validated `[{type, id}, ...]` array (see StoreConversationRequest /
+     * AddParticipantsRequest) into their model instances, grouped by type so each
+     * chatable model is queried once regardless of how many ids were requested.
+     *
+     * @param  array<int, array{type: string, id: int|string}>  $items
+     * @return Collection<int, Model>
+     */
+    public static function resolveMany(array $items): Collection
+    {
+        return collect($items)
+            ->groupBy('type')
+            ->flatMap(function (Collection $group, string $alias) {
+                $model = static::modelForAlias($alias);
+                $ids = $group->pluck('id')->unique()->all();
+
+                return $model::query()->findOrFail($ids);
+            })
+            ->values();
+    }
+
+    /**
+     * Find every chatable (across every configured chatable model) whose name
+     * matches the given term, e.g. for matching a private conversation's other
+     * participant, or a message's sender/conversation, by display name.
+     *
+     * @return array<int, array{0: string, 1: int|string}> [morphType, key] pairs.
+     */
+    public static function matchingChatablePairs(string $term): array
+    {
+        $pairs = [];
+        $limit = (int) config('chat.user_search.max_matching_ids', 500);
+
+        foreach (array_keys(static::chatableModels()) as $morphType) {
+            if (count($pairs) >= $limit) {
+                break;
+            }
+
+            $model = static::modelForAlias($morphType);
+            $instance = new $model;
+            $nameField = static::nameFieldFor($morphType);
+
+            $model::query()
+                ->where($nameField, 'like', static::nameSearchPattern($term))
+                ->limit($limit - count($pairs))
+                ->pluck($instance->getKeyName())
+                ->each(function ($id) use ($morphType, &$pairs) {
+                    $pairs[] = [$morphType, $id];
+                });
+        }
+
+        return $pairs;
+    }
+
+    /**
+     * The LIKE pattern for matching a chatable's name field, per config('chat.user_search.strategy')
+     * — see that config key for why this is configurable instead of always a leading wildcard.
+     */
+    public static function nameSearchPattern(string $term): string
+    {
+        return config('chat.user_search.strategy') === 'starts_with' ? "{$term}%" : "%{$term}%";
+    }
+}

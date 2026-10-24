@@ -1,0 +1,267 @@
+<script setup>
+import { computed, onMounted, ref, watch } from "vue";
+import Avatar from "../shared/Avatar.vue";
+import SidebarScreenHeader from "../shared/SidebarScreenHeader.vue";
+import GlobalMenu from "../shared/GlobalMenu.vue";
+import Icon from "../shared/Icon.vue";
+import { useApi } from "../../composables/useApi";
+import { useConversations } from "../../composables/useConversations";
+import { useMessages } from "../../composables/useMessages";
+import { useUsers } from "../../composables/useUsers";
+import { useSidebarUi } from "../../composables/useSidebarUi";
+import { chatableKey } from "../../chatable";
+import { useChatStore } from "../../store";
+
+const props = defineProps({
+    conversationId: { type: Number, default: null },
+});
+
+const emit = defineEmits(["back", "jump"]);
+
+const { setView } = useSidebarUi();
+const api = useApi();
+const store = useChatStore();
+const { setActive } = useConversations();
+const { unstar } = useMessages();
+const { resolve, get } = useUsers();
+
+const messages = ref([]);
+const loading = ref(true);
+const page = ref(1);
+const hasMore = ref(false);
+
+async function loadPage(pageNumber) {
+    const { data } = await api.get("/starred-messages", {
+        params: { page: pageNumber, conversation_id: props.conversationId },
+    });
+
+    const senders = data.data.map((message) => ({
+        type: message.chatable_type,
+        id: message.chatable_id,
+    }));
+
+    if (senders.length) {
+        const unique = [
+            ...new Map(
+                senders.map((r) => [chatableKey(r.type, r.id), r]),
+            ).values(),
+        ];
+        await resolve(unique);
+    }
+
+    if (pageNumber === 1) {
+        messages.value = data.data;
+    } else {
+        messages.value = [...messages.value, ...data.data];
+    }
+
+    page.value = data.meta?.current_page ?? pageNumber;
+    hasMore.value =
+        (data.meta?.current_page ?? pageNumber) <
+        (data.meta?.last_page ?? pageNumber);
+}
+
+onMounted(async () => {
+    await loadPage(1);
+    loading.value = false;
+});
+
+// Same gap as the media/docs/links panel: this list comes from its own paginated fetch, not the
+// shared message store, so starring/unstarring a message while this panel stays open otherwise
+// only shows up the next time it's closed and reopened. The global panel (no conversationId prop)
+// has no single conversation to watch — fall back to whichever one the chat window next to it is
+// currently showing, the only conversation this session gets live message updates for anyway.
+const scopeMessages = computed(() => {
+    const targetId = props.conversationId ?? store.activeConversationId;
+    return targetId ? (store.messagesByConversation[targetId] ?? []) : [];
+});
+
+watch(
+    () => scopeMessages.value.filter((m) => m.is_starred_by_me).map((m) => m.id).join(","),
+    async (newIdsCsv, oldIdsCsv) => {
+        if (loading.value) return;
+
+        // Surgical add/remove only — rebuilding the list from "every starred message currently
+        // in scope" on each change would reorder every existing row to match this conversation's
+        // own message order any time a single star toggled, shuffling the whole list instead of
+        // just inserting or dropping the one that actually changed.
+        const newIds = newIdsCsv ? newIdsCsv.split(",").map(Number) : [];
+        const oldIds = oldIdsCsv ? oldIdsCsv.split(",").map(Number) : [];
+        const addedIds = newIds.filter((id) => !oldIds.includes(id));
+        const removedIds = oldIds.filter((id) => !newIds.includes(id));
+
+        if (removedIds.length) {
+            messages.value = messages.value.filter((m) => !removedIds.includes(m.id));
+        }
+
+        if (addedIds.length) {
+            const added = scopeMessages.value.filter((m) => addedIds.includes(m.id));
+            const senders = added.map((m) => ({ type: m.chatable_type, id: m.chatable_id }));
+            if (senders.length) {
+                const unique = [...new Map(senders.map((r) => [chatableKey(r.type, r.id), r])).values()];
+                await resolve(unique);
+            }
+            messages.value = [...added, ...messages.value];
+        }
+    },
+);
+
+async function loadMore() {
+    await loadPage(page.value + 1);
+}
+
+function sender(message) {
+    return get({ type: message.chatable_type, id: message.chatable_id });
+}
+
+function conversationLabel(message) {
+    if (!message.conversation) return "";
+    return message.conversation.type === "group"
+        ? message.conversation.name || "Group"
+        : sender(message).name;
+}
+
+const THUMBNAIL_TYPES = new Set(["image", "video", "gif", "sticker"]);
+
+function thumbnail(message) {
+    if (!THUMBNAIL_TYPES.has(message.type)) return null;
+    const attachment = message.attachments?.[0];
+    return attachment?.thumbnail_url || attachment?.url || null;
+}
+
+const TYPE_LABELS = {
+    image: "📷 Photo",
+    video: "🎥 Video",
+    gif: "GIF",
+    sticker: "Sticker",
+    audio: "🎵 Audio",
+    voice: "🎤 Voice message",
+    poll: "📊 Poll",
+    event: "📅 Event",
+};
+
+function snippet(message) {
+    if (message.deleted_for_everyone) return "This message was deleted";
+    switch (message.type) {
+        case "text":
+            return message.body || "";
+        case "document":
+            return `📄 ${message.attachments?.[0]?.original_filename ?? "Document"}`;
+        case "location":
+            return `📍 ${message.metadata?.name || "Location"}`;
+        case "contact":
+            return `👤 ${message.metadata?.name || "Contact"}`;
+        case "poll":
+            return message.metadata?.question
+                ? `📊 ${message.metadata.question}`
+                : TYPE_LABELS.poll;
+        case "event":
+            return message.metadata?.title
+                ? `📅 ${message.metadata.title}`
+                : TYPE_LABELS.event;
+        default:
+            return TYPE_LABELS[message.type] ?? `[${message.type}]`;
+    }
+}
+
+function jumpTo(message) {
+    store.pendingScrollMessageId = message.id;
+    setActive(message.conversation_id);
+    if (props.conversationId) {
+        emit("jump");
+    } else {
+        setView("chats");
+    }
+}
+
+function onBack() {
+    if (props.conversationId) {
+        emit("back");
+    } else {
+        setView("chats");
+    }
+}
+
+async function onUnstar(message) {
+    await unstar(message.id);
+    messages.value = messages.value.filter((m) => m.id !== message.id);
+}
+</script>
+
+<template>
+    <div class="chat-starred-messages-panel flex h-full flex-col bg-chat-surface">
+        <SidebarScreenHeader title="Starred messages" @back="onBack">
+            <GlobalMenu v-if="!conversationId" />
+        </SidebarScreenHeader>
+
+        <div class="chat-scroll flex-1 overflow-y-auto px-2 pb-5">
+            <p v-if="loading" class="px-3 py-4 text-sm text-chat-textMuted">
+                Loading&hellip;
+            </p>
+            <p
+                v-else-if="!messages.length"
+                class="px-3 py-4 text-sm text-chat-textMuted"
+            >
+                No starred messages yet.
+            </p>
+
+            <template v-else>
+                <div
+                    v-for="message in messages"
+                    :key="message.id"
+                    class="flex cursor-pointer items-center gap-3 rounded-chat px-3 py-2.5 hover:bg-chat-surfaceHover"
+                    @click="jumpTo(message)"
+                >
+                    <img
+                        v-if="thumbnail(message)"
+                        :src="thumbnail(message)"
+                        alt=""
+                        class="h-11 w-11 shrink-0 rounded-xl object-cover"
+                    >
+                    <Avatar
+                        v-else
+                        :name="sender(message).name"
+                        :avatar-url="sender(message).avatar_url"
+                        :size="44"
+                    />
+                    <div class="min-w-0 flex-1">
+                        <p class="truncate text-[14px] font-semibold text-chat-text">
+                            {{ conversationLabel(message) }}
+                        </p>
+                        <p class="truncate text-xs text-chat-textMuted">
+                            <span
+                                v-if="message.conversation?.type === 'group'"
+                                >{{ sender(message).name }}: </span
+                            >{{ snippet(message) }}
+                        </p>
+                    </div>
+                    <div class="flex shrink-0 flex-col items-end gap-1.5">
+                        <span class="text-[11px] text-chat-textMuted">{{
+                            new Date(message.created_at).toLocaleTimeString([], {
+                                hour: "2-digit",
+                                minute: "2-digit",
+                            })
+                        }}</span>
+                        <button
+                            type="button"
+                            title="Unstar"
+                            class="flex h-6 w-6 items-center justify-center rounded-full text-chat-accent hover:bg-chat-surface"
+                            @click.stop="onUnstar(message)"
+                        >
+                            <Icon name="star" :size="15" />
+                        </button>
+                    </div>
+                </div>
+
+                <button
+                    v-if="hasMore"
+                    type="button"
+                    class="mx-auto mt-2 block rounded px-3 py-1.5 text-sm text-chat-accent hover:bg-chat-surfaceHover"
+                    @click="loadMore"
+                >
+                    Load more
+                </button>
+            </template>
+        </div>
+    </div>
+</template>

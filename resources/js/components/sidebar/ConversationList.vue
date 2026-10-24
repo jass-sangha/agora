@@ -1,0 +1,404 @@
+<script setup>
+import { computed, nextTick, onMounted, ref, watch } from "vue";
+import ConversationListItem from "./ConversationListItem.vue";
+import SearchBar from "./SearchBar.vue";
+import GlobalMenu from "../shared/GlobalMenu.vue";
+import SidebarScreenHeader from "../shared/SidebarScreenHeader.vue";
+import Icon from "../shared/Icon.vue";
+import Avatar from "../shared/Avatar.vue";
+import { useConversations } from "../../composables/useConversations";
+import { useMessages } from "../../composables/useMessages";
+import { useUsers } from "../../composables/useUsers";
+import { useSidebarUi } from "../../composables/useSidebarUi";
+import { useChatStore } from "../../store";
+import { chatableKey } from "../../chatable";
+
+const store = useChatStore();
+const { refresh, loadMore, hasMorePages, setActive } = useConversations();
+const { search: searchMessages } = useMessages();
+const { resolve, get } = useUsers();
+const { view, filter, setFilter, setView } = useSidebarUi();
+
+const FILTERS = [
+    { key: "all", label: "All" },
+    { key: "unread", label: "Unread" },
+    { key: "favourites", label: "Favourites" },
+    { key: "groups", label: "Groups" },
+];
+
+const showArchived = computed(() => view.value === "archived");
+const searchQuery = ref("");
+const messageHits = ref([]);
+const searching = ref(false);
+const listRoot = ref(null);
+const listSentinel = ref(null);
+const loadingMore = ref(false);
+let observer = null;
+
+async function scrollActiveIntoView({ block = "nearest" } = {}) {
+    const conversationId = store.activeConversationId;
+    if (!conversationId) return;
+    await nextTick();
+    listRoot.value
+        ?.querySelector(`[data-conversation-id="${conversationId}"]`)
+        ?.scrollIntoView({ block, behavior: "smooth" });
+}
+
+async function onSentinelIntersect(entries) {
+    if (entries[0].isIntersecting && !loadingMore.value && hasMorePages.value) {
+        loadingMore.value = true;
+        try {
+            await loadMore();
+        } finally {
+            loadingMore.value = false;
+        }
+    }
+}
+
+function setupObserver() {
+    observer?.disconnect();
+    if (listSentinel.value && listRoot.value) {
+        observer = new IntersectionObserver(onSentinelIntersect, { root: listRoot.value });
+        observer.observe(listSentinel.value);
+    }
+}
+
+onMounted(async () => {
+    await refresh(showArchived.value ? { archived: true } : {});
+    // A freshly created chat/group sorts first — land the list at the top to show it.
+    await scrollActiveIntoView({ block: "start" });
+    nextTick(setupObserver);
+});
+
+watch(showArchived, async (archived) => {
+    await refresh(archived ? { archived: true } : {});
+    nextTick(setupObserver);
+});
+
+watch(
+    () => store.activeConversationId,
+    () => scrollActiveIntoView(),
+);
+
+function toggleArchived() {
+    setView(showArchived.value ? "chats" : "archived");
+}
+
+function select(conversationId) {
+    setActive(conversationId);
+}
+
+function openEmptyChat() {
+    setActive(null);
+    setView("chats");
+    setFilter("all");
+}
+
+function isFavourited(conversation) {
+    return !!(conversation.favourited_at || conversation.me?.favourited_at);
+}
+
+// Mirrors the backend's own ORDER BY exactly (pinned first, most-recently-pinned first among
+// those, then most-recently-active) — `upsertConversation()` only patches a conversation's data
+// in place at its existing array index, it never re-sorts, so without this a freshly pinned (or
+// unpinned) chat would keep its old position until the next full list refetch.
+function sortKey(conversation) {
+    const pinnedAt = conversation.me?.pinned_at
+        ? new Date(conversation.me.pinned_at).getTime()
+        : null;
+    const lastActivityAt = conversation.last_activity_at
+        ? new Date(conversation.last_activity_at).getTime()
+        : 0;
+    return { pinnedAt, lastActivityAt };
+}
+
+const sortedConversations = computed(() =>
+    [...store.conversations].sort((a, b) => {
+        const ka = sortKey(a);
+        const kb = sortKey(b);
+        if ((ka.pinnedAt !== null) !== (kb.pinnedAt !== null)) {
+            return ka.pinnedAt !== null ? -1 : 1;
+        }
+        if (
+            ka.pinnedAt !== null &&
+            kb.pinnedAt !== null &&
+            ka.pinnedAt !== kb.pinnedAt
+        ) {
+            return kb.pinnedAt - ka.pinnedAt;
+        }
+        return kb.lastActivityAt - ka.lastActivityAt;
+    }),
+);
+
+const filteredConversations = computed(() => {
+    // `refresh()` keeps the conversation open on the right in the store even when a filtered
+    // fetch excludes it (e.g. Archived), so the chat window doesn't lose it — exclude it here
+    // when it doesn't actually belong in the Archived list, so it doesn't leak into view.
+    const source = showArchived.value
+        ? sortedConversations.value.filter((c) => c.me?.archived_at)
+        : sortedConversations.value.filter(
+              (c) => !c.me?.archived_at || c.id === store.activeConversationId,
+          );
+
+    switch (filter.value) {
+        case "unread":
+            return source.filter((c) => c.unread_count > 0);
+        case "favourites":
+            return source.filter(isFavourited);
+        case "groups":
+            return source.filter((c) => c.type === "group");
+        default:
+            return source;
+    }
+});
+
+// The conversation list is paginated server-side (see useConversations' loadMore), so
+// filteredConversations only ever sees whatever pages have been fetched so far. A tab like
+// Unread/Favourites/Groups can have zero matches on the loaded page(s) while more conversations
+// (potentially matching ones) still sit on later pages — without this, that tab would show
+// "No conversations here" even though a scroll-triggered load never happens, since a near-empty
+// filtered list doesn't overflow the container enough to reach the bottom sentinel.
+watch(
+    () => [filteredConversations.value.length, hasMorePages.value],
+    async () => {
+        if (!loadingMore.value && !filteredConversations.value.length && hasMorePages.value) {
+            loadingMore.value = true;
+            try {
+                await loadMore();
+            } finally {
+                loadingMore.value = false;
+            }
+        }
+    },
+);
+
+async function onSearchQuery(q) {
+    searchQuery.value = q;
+
+    if (!q) {
+        messageHits.value = [];
+        await refresh();
+        // The results view (v-if="searchQuery") and the normal list (v-else, holding listRoot/
+        // listSentinel) are toggled by v-if/v-else, so clearing search remounts a fresh <ul> —
+        // the observer from before search was entered is watching detached nodes by now.
+        nextTick(setupObserver);
+        return;
+    }
+
+    // Entering search unmounts listRoot/listSentinel (the v-else branch) in favor of the
+    // results view — nothing left for the observer to watch until search is cleared.
+    observer?.disconnect();
+
+    searching.value = true;
+    try {
+        const [, hits] = await Promise.all([
+            refresh({ q }),
+            searchMessages(q, null),
+        ]);
+
+        const refs = hits
+            .map((hit) => otherParticipantOf(hit.conversation))
+            .filter(Boolean);
+        if (refs.length) {
+            const unique = [
+                ...new Map(
+                    refs.map((r) => [chatableKey(r.type, r.id), r]),
+                ).values(),
+            ];
+            await resolve(unique);
+        }
+
+        messageHits.value = hits;
+    } finally {
+        searching.value = false;
+    }
+}
+
+function otherParticipantOf(conversation) {
+    if (!conversation || conversation.type !== "private") return null;
+    return (
+        (conversation.participants ?? []).find(
+            (p) => chatableKey(p.type, p.id) !== store.currentKey,
+        ) ?? null
+    );
+}
+
+function hitLabel(hit) {
+    if (!hit.conversation) return "";
+    if (hit.conversation.type === "group")
+        return hit.conversation.name || "Group";
+    const other = otherParticipantOf(hit.conversation);
+    return other ? get(other).name : "Unknown";
+}
+
+function hitAvatar(hit) {
+    if (!hit.conversation || hit.conversation.type === "group") return null;
+    const other = otherParticipantOf(hit.conversation);
+    return other ? get(other).avatar_url : null;
+}
+
+function hitSnippet(hit) {
+    if (hit.deleted_for_everyone) return "This message was deleted";
+    return hit.type === "text" ? hit.body : `[${hit.type}]`;
+}
+
+function openHit(hit) {
+    store.pendingScrollMessageId = hit.id;
+    setActive(hit.conversation_id);
+    onSearchQuery("");
+}
+</script>
+
+<template>
+    <div class="chat-conversation-list flex h-full flex-col bg-chat-surface">
+        <SidebarScreenHeader
+            v-if="showArchived"
+            title="Archived chats"
+            @back="toggleArchived"
+        >
+            <GlobalMenu />
+        </SidebarScreenHeader>
+
+        <div
+            v-else
+            class="chat-conversation-list__header flex items-center justify-between px-4 py-3"
+        >
+            <button
+                type="button"
+                title="Back to chats"
+                class="font-display text-2xl font-normal text-chat-text"
+                @click="openEmptyChat"
+            >
+                Chats
+            </button>
+
+            <div
+                class="chat-conversation-list__actions flex items-center gap-1.5"
+            >
+                <button
+                    v-if="view !== 'new-chat'"
+                    type="button"
+                    title="New chat"
+                    class="flex h-9 items-center gap-1.5 rounded-full bg-chat-accent px-4 text-sm font-semibold text-chat-accentContrast hover:opacity-90"
+                    @click="setView('new-chat')"
+                >
+                    <Icon name="plus-outline" :size="16" />
+                    New
+                </button>
+
+                <GlobalMenu />
+            </div>
+        </div>
+
+        <SearchBar :autofocus="false" @query="onSearchQuery" />
+
+        <div
+            class="chat-conversation-list__filters flex items-center gap-2 overflow-x-auto overflow-y-visible px-3 pb-3.5 pt-0.5"
+        >
+            <button
+                v-for="f in FILTERS"
+                :key="f.key"
+                type="button"
+                class="relative h-8 shrink-0 rounded-full border border-chat-border px-[15px] text-[12.5px] font-semibold text-chat-textMuted transition-colors hover:bg-chat-surfaceHover"
+                @click="setFilter(f.key)"
+            >
+                <span
+                    v-if="filter === f.key"
+                    class="absolute -inset-px rounded-full border border-chat-sageLine bg-chat-sageTint"
+                />
+                <span class="relative">{{ f.label }}</span>
+            </button>
+        </div>
+
+        <div
+            v-if="searchQuery"
+            class="chat-conversation-list__search-results flex flex-1 flex-col overflow-y-auto"
+        >
+            <div class="shrink-0">
+                <p
+                    v-if="searching"
+                    class="p-4 text-center text-sm text-chat-textMuted"
+                >
+                    Searching&hellip;
+                </p>
+
+                <template v-else>
+                    <h3
+                        v-if="filteredConversations.length"
+                        class="px-4 pb-1 pt-3 text-xs font-medium uppercase text-chat-textMuted"
+                    >
+                        Chats
+                    </h3>
+                    <ul class="px-2 py-1">
+                        <ConversationListItem
+                            v-for="conversation in filteredConversations"
+                            :key="conversation.id"
+                            :conversation="conversation"
+                            :active="conversation.id === store.activeConversationId"
+                            @select="select"
+                        />
+                    </ul>
+
+                    <h3
+                        v-if="messageHits.length"
+                        class="px-4 pb-1 pt-3 text-xs font-medium uppercase text-chat-textMuted"
+                    >
+                        Messages
+                    </h3>
+                    <ul class="px-2 py-1">
+                        <li
+                            v-for="hit in messageHits"
+                            :key="hit.id"
+                            class="flex cursor-pointer items-center gap-3 rounded-2xl px-3 py-2.5 hover:bg-chat-surfaceHover"
+                            @click="openHit(hit)"
+                        >
+                            <Avatar
+                                :name="hitLabel(hit)"
+                                :avatar-url="hitAvatar(hit)"
+                                :size="44"
+                            />
+                            <div class="min-w-0 flex-1">
+                                <span
+                                    class="block truncate text-[15px] text-chat-text"
+                                    >{{ hitLabel(hit) }}</span
+                                >
+                                <span
+                                    class="block truncate text-sm text-chat-textMuted"
+                                    >{{ hitSnippet(hit) }}</span
+                                >
+                            </div>
+                        </li>
+                    </ul>
+
+                    <p
+                        v-if="!filteredConversations.length && !messageHits.length"
+                        class="p-4 text-center text-sm text-chat-textMuted"
+                    >
+                        No results for "{{ searchQuery }}".
+                    </p>
+                </template>
+            </div>
+        </div>
+
+        <ul
+            v-else
+            ref="listRoot"
+            class="chat-conversation-list__items flex flex-1 flex-col overflow-y-auto px-2 py-1"
+        >
+            <ConversationListItem
+                v-for="conversation in filteredConversations"
+                :key="conversation.id"
+                :conversation="conversation"
+                :active="conversation.id === store.activeConversationId"
+                @select="select"
+            />
+            <li
+                v-if="!filteredConversations.length"
+                class="chat-conversation-list__empty p-4 text-center text-sm text-chat-textMuted"
+            >
+                No conversations here.
+            </li>
+            <li ref="listSentinel" class="chat-conversation-list__sentinel h-1" />
+        </ul>
+    </div>
+</template>

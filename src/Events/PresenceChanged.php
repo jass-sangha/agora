@@ -1,0 +1,49 @@
+<?php
+
+namespace Chat\Events;
+
+use Illuminate\Broadcasting\InteractsWithSockets;
+use Illuminate\Broadcasting\PresenceChannel;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Foundation\Events\Dispatchable;
+use Illuminate\Queue\SerializesModels;
+use Chat\Traits\BroadcastsChatEvents;
+
+class PresenceChanged implements ShouldBroadcast
+{
+    use Dispatchable, InteractsWithSockets, SerializesModels, BroadcastsChatEvents;
+
+    /**
+     * @param  int[]  $conversationIds  Conversations the chatable is an active participant of.
+     */
+    public function __construct(
+        public Model $chatable,
+        public bool $isOnline,
+        public ?string $lastSeenAt,
+        public array $conversationIds,
+    ) {}
+
+    public function broadcastOn(): array
+    {
+        return array_map(
+            fn (int $conversationId) => new PresenceChannel("conversation.{$conversationId}"),
+            $this->conversationIds,
+        );
+    }
+
+    public function broadcastAs(): string
+    {
+        return 'presence.changed';
+    }
+
+    public function broadcastWith(): array
+    {
+        return [
+            'chatable_type' => $this->chatable->getMorphClass(),
+            'chatable_id' => $this->chatable->getKey(),
+            'is_online' => $this->isOnline,
+            'last_seen_at' => $this->lastSeenAt,
+        ];
+    }
+}

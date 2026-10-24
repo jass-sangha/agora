@@ -1,0 +1,72 @@
+<script setup>
+import { computed, onMounted, watch } from "vue";
+import { useCall } from "../../composables/useCall";
+import { useUsers } from "../../composables/useUsers";
+import Icon from "../shared/Icon.vue";
+
+const { phase, announcer, peers, isGroupCall, minimized, elapsed, restore, endCall } = useCall();
+const { resolve, get } = useUsers();
+
+const soloRef = computed(() => {
+    if (peers.value.length === 1) return peers.value[0];
+    if (peers.value.length === 0 && announcer.value) return announcer.value;
+    return null;
+});
+
+async function ensureResolved() {
+    if (soloRef.value) {
+        await resolve([soloRef.value]);
+    }
+}
+
+onMounted(ensureResolved);
+watch(soloRef, ensureResolved);
+
+const label = computed(() => {
+    if (soloRef.value) return get(soloRef.value).name ?? "Call";
+    if (isGroupCall.value) return peers.value.length ? `${peers.value.length + 1} in call` : "Group call";
+    return "Call";
+});
+
+const visible = computed(
+    () =>
+        minimized.value &&
+        ["outgoing", "incoming", "connecting", "live"].includes(phase.value),
+);
+
+const statusLabel = computed(() => {
+    if (phase.value === "live") {
+        const s = Math.max(0, Math.round(elapsed.value));
+        return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    }
+    return phase.value === "incoming" ? "Incoming call" : "Ringing…";
+});
+</script>
+
+<template>
+    <button
+        v-if="visible"
+        type="button"
+        title="Return to call"
+        class="chat-animate-pop-in fixed left-1/2 z-[70] flex -translate-x-1/2 items-center gap-3 rounded-full border border-chat-border bg-chat-surface py-2.5 pl-3.5 pr-2.5 shadow-chat-lg top-[calc(max(env(safe-area-inset-top),8px)+52px)] sm:left-24 sm:top-auto sm:bottom-6 sm:translate-x-0"
+        @click="restore"
+    >
+        <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-chat-accent" />
+        <span class="flex min-w-0 items-baseline gap-2">
+            <span class="truncate text-sm font-bold text-chat-text">{{
+                label
+            }}</span>
+            <span
+                class="shrink-0 text-xs font-medium tabular-nums text-chat-textMuted"
+                >{{ statusLabel }}</span
+            >
+        </span>
+        <span
+            title="End call"
+            class="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-chat-danger text-white"
+            @click.stop="endCall()"
+        >
+            <Icon name="phone" :size="15" style="transform: rotate(135deg)" />
+        </span>
+    </button>
+</template>

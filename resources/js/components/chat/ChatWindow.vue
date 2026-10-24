@@ -1,0 +1,308 @@
+<script setup>
+import { computed, nextTick, ref, watch, onUnmounted } from 'vue';
+import axios from 'axios';
+import ChatHeader from './ChatHeader.vue';
+import MessageList from './MessageList.vue';
+import MessageBubble from './MessageBubble.vue';
+import MessageComposer from '../composer/MessageComposer.vue';
+import GroupInfoPanel from '../panels/GroupInfoPanel.vue';
+import Icon from '../shared/Icon.vue';
+import { useChatStore, upsertConversation } from '../../store';
+import { useConversations } from '../../composables/useConversations';
+import { useMessages } from '../../composables/useMessages';
+import { useMessagePins } from '../../composables/useMessagePins';
+import { useEcho } from '../../composables/useEcho';
+import { useBlockedUsers } from '../../composables/useBlockedUsers';
+import { chatableKey, chatableKeyOf } from '../../chatable';
+import { resolveWallpaper } from '../../wallpapers';
+import PoweredBy from '../shared/PoweredBy.vue';
+import { usePreferences } from '../../composables/usePreferences';
+import { useToast } from '../../composables/useToast';
+
+const store = useChatStore();
+const { setActive } = useConversations();
+const { load, loadOlder, markDelivered, markRead, search } = useMessages();
+const { list: listPinned, unpin, pinnedFor } = useMessagePins();
+const { unblock } = useBlockedUsers();
+const { defaultWallpaper } = usePreferences();
+const { show: showToast } = useToast();
+
+const replyTo = ref(null);
+const editing = ref(null);
+const showInfo = ref(false);
+const searchResults = ref([]);
+const chatSearchOpen = ref(false);
+const chatSearchQuery = ref('');
+const chatSearchPending = ref(false);
+let chatSearchDebounceTimer = null;
+let chatSearchRequestId = 0;
+
+const conversation = computed(() => store.conversations.find((c) => c.id === store.activeConversationId));
+const activeSearchQuery = computed(() => (chatSearchOpen.value ? chatSearchQuery.value : ''));
+const wallpaper = computed(() =>
+    resolveWallpaper(conversation.value?.me?.wallpaper ?? defaultWallpaper.value),
+);
+
+const otherParticipant = computed(() => {
+    if (!conversation.value || conversation.value.type !== 'private') return null;
+    const other = (conversation.value.participants ?? []).find((p) => chatableKeyOf(p) !== store.currentKey);
+    return other ? { type: other.chatable_type, id: other.chatable_id } : null;
+});
+
+const isBlocked = computed(() => (
+    !!otherParticipant.value && store.blockedKeys.includes(chatableKey(otherParticipant.value.type, otherParticipant.value.id))
+));
+
+async function onUnblock() {
+    if (otherParticipant.value) {
+        await unblock(otherParticipant.value.type, otherParticipant.value.id);
+    }
+}
+
+function onToggleChatSearch() {
+    chatSearchOpen.value = !chatSearchOpen.value;
+    if (!chatSearchOpen.value) chatSearchQuery.value = '';
+}
+
+watch(() => store.activeConversationId, async (newId, oldId) => {
+    replyTo.value = null;
+    editing.value = null;
+    showInfo.value = false;
+
+    if (oldId) useEcho().leaveConversation(oldId);
+
+    if (newId) {
+        useEcho().joinConversation(newId);
+        await load(newId);
+        await markDelivered(newId);
+        await listPinned(newId);
+        const messages = store.messagesByConversation[newId] ?? [];
+        if (messages.length) {
+            await markRead(newId, messages[messages.length - 1].id);
+
+            // `markRead` returns no content, so the sidebar badge is cleared locally rather
+            // than waiting on a broadcast/refetch of this conversation's unread_count.
+            const readConversation = store.conversations.find((c) => c.id === newId);
+            if (readConversation && readConversation.unread_count) {
+                upsertConversation({ ...readConversation, unread_count: 0 });
+            }
+        }
+
+        if (store.pendingScrollMessageId) {
+            const pendingId = store.pendingScrollMessageId;
+            store.pendingScrollMessageId = null;
+            nextTick(() => scrollToMessage(pendingId));
+        }
+    }
+}, { immediate: true });
+
+// Handles jumping to a message within the conversation that's already open — a switch to a
+// different conversation is instead handled inside the activeConversationId watcher above,
+// once that conversation's messages have actually loaded. `setActive()` is a no-op when the
+// target conversation is already the active one (Vue's watcher on activeConversationId won't
+// re-fire for a same-value assignment), so this is the only signal for that case.
+watch(() => store.pendingScrollMessageId, (id) => {
+    if (!id) return;
+    store.pendingScrollMessageId = null;
+    scrollToMessage(id);
+});
+
+const pinnedMessages = computed(() => (conversation.value ? pinnedFor(conversation.value.id) : []));
+
+// The target may be older than what's currently paginated into the DOM (jumping to a search hit
+// or a pinned/starred message from way back in history) — keep loading older pages until it
+// shows up or there's genuinely nothing left, instead of silently giving up when the element
+// isn't found on the first try.
+async function scrollToMessage(messageId, { conversationId = null } = {}) {
+    const targetConversationId = conversationId ?? store.activeConversationId;
+    if (!targetConversationId) return false;
+
+    let el = document.getElementById(`chat-message-${messageId}`);
+    let guard = 0;
+
+    while (!el && guard < 30) {
+        const older = await loadOlder(targetConversationId);
+        if (!older.length) break;
+        await nextTick();
+        el = document.getElementById(`chat-message-${messageId}`);
+        guard += 1;
+    }
+
+    if (!el) return false;
+
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('chat-message-bubble--highlight');
+    setTimeout(() => el.classList.remove('chat-message-bubble--highlight'), 1600);
+    return true;
+}
+
+async function onUnpinFromBanner(message) {
+    await unpin(message);
+}
+
+function jumpToResult(message) {
+    chatSearchOpen.value = false;
+    chatSearchQuery.value = '';
+    nextTick(() => scrollToMessage(message.id));
+}
+
+watch([activeSearchQuery, () => conversation.value?.id], ([q, conversationId]) => {
+    clearTimeout(chatSearchDebounceTimer);
+    const requestId = ++chatSearchRequestId;
+
+    if (!q || !conversationId) {
+        searchResults.value = [];
+        chatSearchPending.value = false;
+        return;
+    }
+
+    searchResults.value = [];
+    chatSearchPending.value = true;
+    chatSearchDebounceTimer = setTimeout(async () => {
+        try {
+            const results = await search(q, conversationId);
+
+            if (requestId === chatSearchRequestId) {
+                searchResults.value = results;
+            }
+        } catch (error) {
+            if (!axios.isAxiosError(error)) {
+                throw error;
+            }
+
+            if (requestId === chatSearchRequestId) {
+                showToast('Could not search messages. Please try again.');
+            }
+        } finally {
+            if (requestId === chatSearchRequestId) {
+                chatSearchPending.value = false;
+            }
+        }
+    }, 500);
+});
+
+onUnmounted(() => {
+    clearTimeout(chatSearchDebounceTimer);
+    chatSearchRequestId += 1;
+    if (store.activeConversationId) useEcho().leaveConversation(store.activeConversationId);
+});
+
+function onBack() {
+    setActive(null);
+}
+
+function onReply(message) {
+    replyTo.value = message;
+    editing.value = null;
+}
+
+function onEdit(message) {
+    editing.value = message;
+    replyTo.value = null;
+}
+</script>
+
+<template>
+    <div v-if="!conversation" class="chat-chat-window-empty flex h-full flex-col items-center justify-center gap-2 bg-chat-chatBg text-chat-textMuted">
+        <p>Select a conversation to start chatting.</p>
+        <PoweredBy />
+    </div>
+
+    <div v-else class="chat-chat-window relative flex h-full min-w-0">
+        <div class="chat-chat-window__main flex h-full min-w-0 flex-1 flex-col">
+            <ChatHeader
+                :conversation="conversation"
+                :search-open="chatSearchOpen"
+                @back="onBack"
+                @open-info="showInfo = !showInfo"
+                @toggle-search="onToggleChatSearch"
+            />
+
+            <div v-if="chatSearchOpen" class="chat-chat-window__inline-search flex items-center gap-2 border-b border-chat-border bg-chat-surface px-3 py-2">
+                <input
+                    v-model="chatSearchQuery"
+                    type="text"
+                    autofocus
+                    placeholder="Search in this chat"
+                    class="flex-1 rounded-full bg-chat-surfaceHover px-4 py-1.5 text-sm text-chat-text focus:outline-none"
+                    @keydown.escape="onToggleChatSearch"
+                >
+                <button
+                    type="button"
+                    title="Close search"
+                    class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-chat-textMuted hover:bg-chat-surfaceHover"
+                    @click="onToggleChatSearch"
+                >
+                    <Icon name="close-alt" :size="18" />
+                </button>
+            </div>
+
+            <div v-if="pinnedMessages.length" class="chat-chat-window__pinned-banner border-b border-chat-border bg-chat-surface">
+                <div
+                    v-for="pinned in pinnedMessages"
+                    :key="pinned.id"
+                    class="chat-chat-window__pinned-item flex cursor-pointer items-center gap-2 border-b border-chat-border px-3 py-1.5 last:border-b-0 hover:bg-chat-surfaceHover"
+                    @click="scrollToMessage(pinned.id)"
+                >
+                    <span class="flex shrink-0 items-center text-chat-accent">
+                        <Icon name="pin" :size="12" />
+                    </span>
+                    <span class="flex-1 truncate text-xs text-chat-textMuted">{{ pinned.deleted_for_everyone ? 'This message was deleted' : (pinned.type === 'text' ? pinned.body : `[${pinned.type}]`) }}</span>
+                    <button type="button" class="chat-chat-window__pinned-unpin text-xs text-chat-textMuted hover:text-chat-danger" @click.stop="onUnpinFromBanner(pinned)">✕</button>
+                </div>
+            </div>
+
+            <div class="relative flex min-h-0 flex-1 flex-col">
+                <div class="pointer-events-none absolute inset-0 overflow-hidden">
+                    <div
+                        class="absolute inset-0 bg-chat-chatBg"
+                        :style="{
+                            backgroundImage: wallpaper.backgroundImage ?? undefined,
+                            backgroundSize: wallpaper.backgroundSize ?? undefined,
+                            backgroundPosition: wallpaper.backgroundPosition ?? undefined,
+                            backgroundRepeat: wallpaper.backgroundRepeat ?? undefined,
+                        }"
+                    />
+                </div>
+
+                <div v-if="activeSearchQuery" class="chat-chat-window__search-results relative min-h-0 flex-1 overflow-y-auto p-3">
+                    <p class="mb-2 text-xs text-chat-textMuted">Results for "{{ activeSearchQuery }}"</p>
+                    <p v-if="chatSearchPending" class="text-sm text-chat-textMuted">Searching&hellip;</p>
+                    <template v-else-if="searchResults.length">
+                        <div v-for="message in searchResults" :key="message.id" class="cursor-pointer" @click="jumpToResult(message)">
+                            <MessageBubble :message="message" />
+                        </div>
+                    </template>
+                    <p v-else class="text-sm text-chat-textMuted">No messages found.</p>
+                </div>
+
+                <MessageList
+                    v-else
+                    :conversation-id="conversation.id"
+                    @reply="onReply"
+                    @edit="onEdit"
+                />
+
+                <div v-if="isBlocked" class="chat-chat-window__blocked-bar relative flex shrink-0 items-center justify-between gap-2 border-t border-chat-border bg-chat-surface px-4 py-3">
+                    <span class="text-sm text-chat-textMuted">You blocked this contact. New messages won't be sent.</span>
+                    <button type="button" class="shrink-0 text-sm font-medium text-chat-accent" @click="onUnblock">Unblock</button>
+                </div>
+
+                <MessageComposer
+                    v-else
+                    :conversation-id="conversation.id"
+                    :reply-to="replyTo"
+                    :editing="editing"
+                    @dismiss-reply="replyTo = null"
+                    @dismiss-edit="editing = null"
+                />
+            </div>
+        </div>
+
+        <GroupInfoPanel
+            v-if="showInfo"
+            :conversation="conversation"
+            @close="showInfo = false"
+        />
+    </div>
+</template>
