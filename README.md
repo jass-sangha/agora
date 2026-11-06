@@ -23,6 +23,12 @@ php artisan chat:install
 
 The demo app requires a real login flow. The chat route and API are protected by `auth`/`sanctum`, so make sure your app already exposes a working login route and session-based authentication. If you do not have a login route, the package will not be able to authenticate the chat user.
 
+## Walkthrough
+
+<div align="center">
+  <img src="docs/videos/agora-walkthrough.gif" alt="Agora chat walkthrough" width="900" />
+</div>
+
 ---
 
 ## Screenshots
