@@ -6,7 +6,7 @@ A Laravel real-time chat package with conversations, groups, reactions, replies,
 
 ## Demo
 
-Try the [live demo](https://agora-demo-n0w6.onrender.com/chat).
+Try the [live demo](https://agora-demo-n0w6.onrender.com).
 
 Use the built-in UI or the JSON API only.
 
@@ -162,9 +162,11 @@ Group calls currently use a peer-to-peer mesh, so every participant uploads medi
 For native Android/iOS WebViews, relay proximity sensor changes to the widget by dispatching a `chat:proximity` event with a boolean `near` value. The call UI displays a touch-blocking black screen while the sensor reports near, and restores the call when it reports away:
 
 ```js
-window.dispatchEvent(new CustomEvent('chat:proximity', {
-    detail: { near: true },
-}));
+window.dispatchEvent(
+    new CustomEvent("chat:proximity", {
+        detail: { near: true },
+    }),
+);
 ```
 
 Dispatch the same event with `{ near: false }` when the phone moves away. The bundled web UI does not have reliable access to native proximity sensors by itself; the host app must listen to the native sensor and forward its state into the WebView.
